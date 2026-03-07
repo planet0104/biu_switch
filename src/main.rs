@@ -73,7 +73,7 @@ fn main() -> ! {
 
         //等待开机完成后(5秒),切换到蓝牙模式,切换太快没有效果
         delay.delay_ms(5000);
-        switch_to_bluetooth(bluetooth_switch, &mut delay);
+        let _bluetooth_switch = switch_to_bluetooth(bluetooth_switch, &mut delay);
         delay.delay_ms(6000); //跳过蓝牙提示音
         speaker.turnon();
 

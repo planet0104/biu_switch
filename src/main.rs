@@ -1,142 +1,85 @@
-#![deny(unsafe_code)]
-#![allow(clippy::empty_loop)]
-#![no_main]
+//! # biu_switch — nRF52840 + JDY-68A 蓝牙音箱固件
+//!
+//! 目标板：ProMicro nRF52840（兼容 Nice!Nano V2）
+
 #![no_std]
+#![no_main]
 
-// use cortex_m_semihosting::hprintln;
-use panic_semihosting as _;
+#[cfg(all(feature = "usb-log", feature = "defmt-rtt"))]
+compile_error!("usb-log 与 defmt-rtt 不能同时启用");
 
-use cortex_m_rt::entry;
-use speaker::Speaker;
-use stm32f4xx_hal::{
-    self as hal, gpio::{DefaultMode, PA6, PA7}, i2s::{
-        stm32_i2s_v12x::{
-            marker::{Data16Channel16, Philips},
-            transfer::{I2sTransfer, I2sTransferConfig},
-        },
-        I2s,
-    }, pac::TIM5, timer::Delay
-};
+use embassy_executor::Spawner;
 
-use crate::hal::{pac, prelude::*};
+#[cfg(not(feature = "usb-log"))]
+use defmt_rtt as _;
 
-mod speaker;
+#[cfg(feature = "usb-log")]
+mod usb_log;
 
-#[entry]
-fn main() -> ! {
-    if let (Some(dp), Some(_cp)) = (
-        pac::Peripherals::take(),
-        cortex_m::peripheral::Peripherals::take(),
-    ) {
-        //A5继电器(接地),A6电源(接地),A7切换蓝牙(接地)
+use {panic_probe as _};
 
-        // Set up the LED. On the Mini-F4 it's connected to pin PC13.
-        let gpioc = dp.GPIOC.split();
-        let gpiob = dp.GPIOB.split();
-        let gpioa = dp.GPIOA.split();
-        let mut speaker = Speaker::new(gpioa.pa5.into_floating_input());
-        let mut power_control = gpioa.pa6.into_floating_input();
-        let bluetooth_switch = gpioa.pa7.into_floating_input();
-        
-        // Set up the system clock. We want to run at 48MHz for this one.
-        let rcc = dp.RCC.constrain();
-        let clocks = rcc
-            .cfgr
-            .use_hse(25.MHz())
-            .sysclk(48.MHz())
-            .i2s_clk(61440.kHz())
-            .freeze();
+mod audio_state;
+mod auto_shutdown;
+#[cfg(not(feature = "no-battery"))]
+mod battery;
+mod board_led;
+mod bootloader;
+mod button;
+mod events;
+mod jdy68a;
+mod log_line;
+mod pins;
+mod power;
 
-        // I2S pins: (WS, CK, MCLK, SD) for I2S2
-        let i2s2_pins = (
-            gpiob.pb12, //WS
-            gpiob.pb13, //CK
-            gpioc.pc6,  //MCK
-            gpiob.pb15, //SD
-        );
-        let i2s2 = I2s::new(dp.SPI2, i2s2_pins, &clocks);
+use events::{PowerCommand, POWER_CMDS};
+use power::PowerManager;
 
-        let transfer_config = I2sTransferConfig::new_master()
-            .receive()
-            .standard(Philips)
-            .data_format(Data16Channel16)
-            .master_clock(true)
-            .request_frequency(16_000);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_nrf::init(Default::default());
 
-        let mut transfer = I2sTransfer::new(i2s2, transfer_config);
-        transfer.begin();
+    #[cfg(feature = "usb-log")]
+    {
+        usb_log::enable_hfclk();
+        usb_log::spawn(&spawner, p.USBD);
+    }
 
-        // Create a delay abstraction based on general-pupose 32-bit timer TIM5
-        let mut delay = dp.TIM5.delay_us(&clocks);
+    log_line::line("biu_switch boot");
 
-        speaker.turnoff();//跳过蓝牙切换提示音
+    #[cfg(not(feature = "no-led"))]
+    board_led::spawn(&spawner, p.PWM1, p.P0_15);
+    #[cfg(feature = "no-led")]
+    board_led::spawn(&spawner, p.P0_15);
 
-        //等待开机完成后(5秒),切换到蓝牙模式,切换太快没有效果
-        delay.delay_ms(5000);
-        let _bluetooth_switch = switch_to_bluetooth(bluetooth_switch, &mut delay);
-        delay.delay_ms(6000); //跳过蓝牙提示音
-        speaker.turnon();
+    #[cfg(not(feature = "no-battery"))]
+    battery::spawn(&spawner, p.SAADC, p.P0_04);
 
-        //读取1秒钟缓冲区
-        let mut buf = [0i16; 16000];
-        let mut no_sound_duration_seconds = 0;
+    let mut power = PowerManager::new(p.P0_13, p.P0_08);
+    power.power_on().await;
 
-        loop {
-            let mut buf_iter = buf.iter_mut().peekable();
+    audio_state::spawn(&spawner);
+    auto_shutdown::spawn(&spawner);
+    button::spawn(&spawner, p.P0_09);
+    jdy68a::spawn(
+        &spawner,
+        p.UARTE0,
+        p.TIMER0,
+        p.PPI_CH0,
+        p.PPI_CH1,
+        p.P0_06,
+        p.P0_02,
+        p.P0_17,
+    );
 
-            //阻塞读取1秒钟的声音数据
-            let _ = transfer.read_while(|s: (i16, i16)| {
-                if let Some(b) = buf_iter.next() {
-                    *b = s.0
+    log_line::line("speaker running");
+
+    loop {
+        match POWER_CMDS.receive().await {
+            PowerCommand::PowerOff => {
+                if power.is_powered_on() {
+                    power.power_off_and_sleep().await;
                 }
-                buf_iter.peek().is_some()
-            });
-
-            //计算平均音量
-            let avg = buf
-                .iter()
-                .map(|&x| x.abs() as i32) // 转成i32防止溢出
-                .sum::<i32>()
-                / buf.len() as i32;
-            let avg = avg/10;
-            // avg/10 没有声音时=3，播放音乐时，大于等于5!!
-            // hprintln!("{}", avg / 10);
-            if avg <= 4 {
-                no_sound_duration_seconds += 1;
-            }else{
-                no_sound_duration_seconds = 0;
-            }
-            //10分钟后没有声音，关机
-            if no_sound_duration_seconds > 60 * 10{
-                //先关闭麦克风
-                speaker.turnoff();
-                power_control = power_off(power_control, &mut delay);
-                //跳过关机音
-                delay.delay_ms(3000);
-                speaker.turnon();
             }
         }
     }
-
-    loop {}
-}
-
-
-//开机后，电源按钮引脚默认是floating_input，此时与负极断开
-//关机时，将电源引脚转换成输出模式，并设置低电平，此时相当于按下了按钮，将会关机.
-fn power_off(pin: PA6<DefaultMode>, delay:&mut Delay<TIM5, 1000000>) -> PA6<DefaultMode>{
-    let mut pin_output = pin.into_push_pull_output();
-    pin_output.set_low();
-    delay.delay_ms(1500);
-    //切换回阻塞模式
-    pin_output.into_floating_input()
-}
-
-// 切换到蓝牙模式(io连接低电平，触发蓝牙按钮)
-fn switch_to_bluetooth(pin: PA7<DefaultMode>, delay:&mut Delay<TIM5, 1000000>) -> PA7<DefaultMode>{
-    let mut pin_output = pin.into_push_pull_output();
-    pin_output.set_low();
-    delay.delay_ms(200);
-    //切换回阻塞模式
-    pin_output.into_floating_input()
 }

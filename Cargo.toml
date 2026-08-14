@@ -1,28 +1,51 @@
 [package]
-name = "biu_switch"
-version = "1.0.0"
-authors = ["Jia Ye <planet0104@gmail.com>"]
+name    = "biu_switch"
+version = "0.2.0"
 edition = "2021"
+description = "nrf52840+jdy自动关机蓝牙音箱"
+
+[workspace]
+
+[features]
+default = ["defmt-rtt"]
+# 调试：关闭 P0.15 板载 LED
+no-led = []
+# ProMicro 等克隆板：P0.15 红灯为高电平点亮（Nice!Nano 蓝灯为低电平点亮，不要开此 feature）
+led-active-high = []
+# 调试：跳过 SAADC 电池采样（排除 ADC 初始化导致崩溃）
+no-battery = []
+# defmt 经 RTT 输出（SWD 调试器）；与 usb-log 二选一
+defmt-rtt = ["dep:defmt-rtt"]
+# USB CDC 明文 ASCII 日志（普通串口助手可读）；串口发送 BOOT 进 Bootloader
+usb-log = ["dep:embassy-usb"]
 
 [dependencies]
-embedded-hal = "1.0.0"
-cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7.5"
-# Panic behaviour, see https://crates.io/keywords/panic-impl for alternatives
-panic-semihosting = "0.6.0"
-# cortex-m-semihosting = "0.5.0"
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-nrf = { version = "0.8.0", features = ["defmt", "nrf52840", "time-driver-rtc1", "gpiote", "unstable-pac", "nfc-pins-as-gpio"] }
+embassy-futures = { version = "0.1.2" }
+embassy-sync = { version = "0.8.0", features = ["defmt"] }
 
-stm32f4xx-hal  = { version = "0.22.1", features = ["stm32f401", "i2s"]}
-embedded-storage = "0.3"
+defmt = "1.0.1"
+defmt-rtt = { version = "1.0.0", optional = true }
+embassy-usb = { version = "0.5", optional = true }
+static_cell = "2"
 
-[profile.dev]
-#debug = true
-lto = true
-#opt-level = "s"
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.0"
+critical-section = "1.1"
+
+embedded-hal = { version = "1.0" }
+
+portable-atomic = { version = "1.5", features = ["critical-section"] }
+
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
 [profile.release]
-lto = true
-strip = true
-opt-level = 's'
-panic = 'abort'
-codegen-units = 1
+codegen-units    = 1
+debug            = 2
+debug-assertions = false
+incremental      = false
+lto              = "fat"
+opt-level        = "s"
+overflow-checks  = false

@@ -1,86 +1,108 @@
-# biu_switch
-用于苏宁小biu蓝牙音箱上的STM32开关控制程序
+# biu_switch — nRF52840 + JDY-68A 蓝牙音箱固件
 
-在没有接收到音频信号超过N分钟之后，自动触发关机操作.
+基于 **ProMicro nRF52840**（兼容 **Nice!Nano V2**）的蓝牙音箱控制固件：通过 **JDY-68A** 接收手机蓝牙音频，经 **PAM8406** 功放驱动喇叭；支持自动关机、按钮唤醒、播放/连接状态检测。调试日志可选 `usb-log`（烧录脚本默认启用）。
 
-芯片型号: STM32F401RCT6
+详细硬件与时序见 [`蓝牙音箱固件设计文档.md`](蓝牙音箱固件设计文档.md)。
 
-编译通过的Rust版本: 
+## 硬件接线（摘要）
 
-## 安装 Rust和一些工具
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| JDY VCC | 开发板 **VCC**（P0.13 内部控制） | 必须接 VCC，不能接常开 3.3V |
+| 功放电源 | **P0.08** (D0) → 330Ω → XYF-1H6 IN+ | 高=功放上电；RAW → 继电器 → PAM8406 |
+| UART RX | **P0.06** (D1) ← JDY TXD | 9600 8N1 |
+| UART TX | **P0.02** (D19) → JDY RXD | 关机前拉低，防倒灌 |
+| STAT | **P0.17** (D2) ← JDY STAT | 高=已连接 |
+| 唤醒按钮 | **P0.09** (D10) → 按钮 → GND | 内部上拉；需 `nfc-pins-as-gpio` |
+| 板载 LED | **P0.15** | ProMicro 红灯用 `led-active-high` |
+| 电池 ADC | **P0.04** | Nice!Nano / 兼容板分压 |
 
-https://www.rust-lang.org/zh-CN/tools/install
+## 行为说明
 
-https://docs.rust-embedded.org/book/intro/tooling.html
+| 需求 | 实现 |
+|------|------|
+| 开机时序 | 按钮唤醒冷启动 → JDY 上电 → 等 600ms → 功放上电（防爆音） |
+| 蓝牙名 | 开机查询 `AT+NAMA`；若不是 **BiuSpeaker** 则自动改名 |
+| 关机时序 | TX 拉低 → 功放断电 → JDY 断电 → **SYSTEM OFF** |
+| 自动关机 | 蓝牙断开或暂停后 **10 分钟**无活动 → 关机；连接/播放中取消倒计时 |
+| 唤醒 | 按 P0.09 → GPIO SENSE 唤醒 → 冷启动 |
+| 板载 LED | 呼吸灯（后续可改为状态指示） |
+| 烧录 | 双击 RST 进 UF2；或 USB 串口发送 `BOOT` |
 
-https://blog.csdn.net/niuiic/article/details/113407435
+> 测极低功耗请 **拔掉 USB**，仅用电池供电。
 
-```bat
-:: 切换至nightly
-rustup default nightly
-:: 安装交叉编译工具
-rustup target add thumbv7em-none-eabihf
+## Feature
 
-:: 安装 cargo-binutils
-cargo install cargo-binutils
-rustup component add llvm-tools-preview
+| Feature | 说明 |
+|---------|------|
+| `usb-log` | USB CDC **明文 ASCII** 日志（SSCOM 等串口助手可直接看；与 `defmt-rtt` 互斥） |
+| `defmt-rtt` | defmt 经 SWD RTT 输出（默认 feature） |
+| `led-active-high` | ProMicro 红灯高电平点亮 |
+| `no-led` | 关闭板载 LED（调试） |
+| `no-battery` | 跳过 SAADC（调试） |
 
-:: 安装 cargo-generate
-cargo install cargo-generate
+## 编译
+
+```powershell
+rustup target add thumbv7em-none-eabi
+cargo build --release --no-default-features --features usb-log,led-active-high
 ```
 
-## 安装arm-none-eabi-gdb工具
+产物：`target/thumbv7em-none-eabi/release/biu_switch`
 
-https://developer.arm.com/open-source/gnu-toolchain/gnu-rm/downloads
+## 烧录
 
-```bat
-:: 验证
-arm-none-eabi-gdb -v
+```powershell
+.\flash.bat
 ```
 
-## 安装 openocd
+量产/无 USB 日志：
 
-https://xpack.github.io/openocd/install/
-
-```bat
-::安装xpm
-npm install --global xpm@latest
-::验证安装
-dir "%APPDATA%"\npm\xpm*
-xpm --version
-::安装openocd
-xpm install --global @xpack-dev-tools/openocd@latest --verbose
-::验证安装
-%USERPROFILE%\AppData\Roaming\xPacks\@xpack-dev-tools\openocd\0.11.0-1.1\.content\bin\openocd.exe --version
-
-::将openocd的bin路径添加到path中
-openocd -v
-
+```powershell
+.\flash-release.bat
 ```
 
-## 连接st-link v2
+有 SWD 时可用脚本菜单 **[3]**，或：
 
-安装驱动：https://www.st.com/en/development-tools/stsw-link009.html#get-software
-
-## openocd连接 stlink
-```bat
-::在新的窗口中启动
-openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
-
-::注意：端口6666不能被占用 否则提示 Error: couldn't bind tcl to socket on port 6666: No error
-
-::查看所有端口
-netstat -ano
-:: 结束指定的PID进程
-tasklist|findstr PID
+```powershell
+probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabi/release/biu_switch
 ```
 
-将st-link v2连接到stm32和电脑，在当前路径下打开控制台窗口运行openocd，再在当前路径下打开另一个控制台窗口，运行run.cmd。
+## 调试（USB 明文日志）
 
-## 查看控制台输出
+烧录 `flash.bat`（默认 `usb-log`）后，用任意串口助手打开 CDC 口即可，例如：
 
-```rust
-// 在openocd控制台可看到输出
-use cortex_m_semihosting::hprintln;
-hprintln!("start!").unwrap();
+```
+usb cdc ready
+biu_switch boot
+power on: complete
+STAT: connected
+BT connected
+UART: play
+music playing
+UART: pause
+music paused
+STAT: disconnected
+BT disconnected
+```
+
+发送 `BOOT` 并回车可进 UF2 Bootloader。
+
+> 旧版 defmt 二进制日志在 SSCOM 里会显示为乱码；现已改为明文 ASCII。
+
+## 模块结构
+
+```
+src/
+├── main.rs           # 初始化与电源命令循环
+├── power.rs          # P0.13/P0.08 时序 + SYSTEM OFF
+├── jdy68a.rs         # UART 事件解析 + STAT 监控
+├── audio_state.rs    # 连接/播放状态机
+├── auto_shutdown.rs  # 10 分钟自动关机
+├── button.rs         # 运行中按键（取消倒计时）
+├── events.rs         # 事件通道
+├── board_led.rs      # 板载 LED（保留）
+├── battery.rs        # 电池采样（保留）
+├── usb_log.rs        # USB CDC defmt（保留）
+└── bootloader.rs     # UF2 软入口（保留）
 ```
